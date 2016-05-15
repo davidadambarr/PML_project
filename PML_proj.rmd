@@ -1,0 +1,245 @@
+---
+title: "PML_project"
+author: "davidadambarr"
+date: "15 May 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(caret)
+library(AppliedPredictiveModeling)
+library(rpart.plot)
+library(rattle)
+library(ElemStatLearn)
+library(gbm)
+library(elasticnet)
+library(e1071)
+library(mice)
+library(VIM)
+library(dplyr)
+library(ggplot2)
+setwd("C:/Users/David/OneDrive/Coursera/machine learning/wd")
+set.seed(221214)
+testing <- read.csv("C:/Users/David/OneDrive/Coursera/machine learning/wd/pml-testing.csv", stringsAsFactors=FALSE)
+training <- read.csv("C:/Users/David/OneDrive/Coursera/machine learning/wd/pml-training.csv", stringsAsFactors=FALSE)
+training <- dplyr::select(training, -X)
+```
+
+## Introduction
+
+The objective for this assignment is to predict a 'class' of barbell movement using data collected from accelerometers on the belt, forearm, arm, and dumbell. Breifly, the data collection set up was as follows:  
+
+* 6 participants were asked to perform barbell lifts correctly and incorrectly in 5 different ways (class A - E).
+* We are provided with a large data set of accelerometer observations for each of 19622 barbell movement episodes, along with an index of the class that barbell movement episode corresponded to, defined here as the **full training set**.
+* In addition there is a small data set of 20 barbell movement episodes for which we are not given the true task, defined here as the **validation set**.
+* The specific aim is therefore to use the quantitative information in the large data set to build a model which can accurately predict the class of barbell movement in the second, smaller, validation data set.  
+
+***********
+
+## Examination structure of the full training set  
+
+#### Missing data
+All empty data cells are assigned NA values. The structure of missing data is then examined visually and quantified by variable to see which variables are of limited value due to missingness. 
+
+First a plot of missingness. 5% of the observations are selected at random and plotted by row (barbell episode) and column (variable). NA values are coloured red.
+
+```{r, warning=FALSE}
+rows <- sample(nrow(training), 0.05*nrow(training))
+matrixplot(training[rows,], cex.axis=0.5)
+```
+
+Clearly some variables are highly missing while some have nearly 100% available observations. this suggests a rational cut off on missingness for which variables to include, as shown in the following plot:
+
+```{r, warning=FALSE}
+missing <- data.frame(colSums(is.na(training)))
+vars <- rownames(missing)
+missing <- cbind(missing, vars)
+n <- nrow(training)
+names(missing) <- c("n_missing", "vars")
+missing$vars <- as.character(missing$vars)
+missing <- dplyr::mutate(missing, prop_missing=n_missing/n)
+
+p1 <- ggplot(missing, aes(x=prop_missing))
+p1 + stat_ecdf(colour="darkgreen", size=1.5, alpha=0.7) +
+  geom_abline(intercept = 0, slope = 1, colour="grey") + xlim(0,1) +
+  xlab("Proportion of observations missing is less than") +
+  ylab("Proportion of variables") +
+  ggtitle("Cumulative frequncy of missing observations by variable")
+```
+  
+there are 59 variables with no missing observations, and the remaining variables are 100% missing in 97% of cases - we exclude those variables from further analysis with the following code:
+```{r}
+vars <- missing$vars[which(missing$prop_missing<0.5)]
+training <- training[,vars]
+sum(complete.cases(training)) # n=19622
+```
+  
+#### Variables with little variability
+
+Next we exclude any variables with minimal variability using the nearZeroVar function of caret package.
+```{r}
+nzv <- nearZeroVar(training, saveMetrics=TRUE)
+sum(nzv$nzv) #n=1 variables to drop
+vars <- names(training)
+keep.vars <- vars[which(nzv$nzv==FALSE)]
+training <- training[,keep.vars]
+rm(nzv)
+```
+
+Only one variable is dropped by this procedure.  
+
+#### Preprocessing variables
+
+The remaining variables, if numeric, are preprocessed by centering and scaling. This details of this preprocessing are stored for future use on the validation set.  
+```{r}
+preProcVars <- names(training)
+preObj <- preProcess(training, method=c("center","scale"))
+training <- predict(preObj, training)
+```
+
+
+#### Manual examine variable names and structure
+
+At this point manual examination of the data class and name for each remaining variable showed them all to be numeric except user name and some time variables. Both these variables are potentially problematic as they suggest possible dependence in the data structure which may not be capturable in a model that is applied to observations made at some future time point and in some different users. The (dubious) approach we take is to remove time variables but keep the user names as they are the same users as in the validation set. This clearly has important implications for extending the model beyond those individuals.   
+```{r}
+time.vars <- grep("time", names(training))
+training <- training[ ,-time.vars]
+training$user_name <- as.factor(training$user_name)
+training$classe <- as.factor(training$classe)
+```  
+
+## Split full training set into training and test (sub)sets
+
+Next we split the full training set so that we have a large training subset and a test set reserved from the full training set (needed as we dont actually have a test set yet we can use to test models before validation out of sample).
+
+```{r}
+inTrain <- createDataPartition(y=training$classe,
+                               p=0.75, list=FALSE)
+trainDF <- training[inTrain,]
+testDF <- training[-inTrain,]
+```
+
+## Model building on training subset
+
+Five models were built using 5 different methods: decisioon tree (CART), random forrest (RF), boosted trees (boost), linear discriminant analysis (lda), and support vector machine (svm) modelling.  
+
+Default settings within the caret package were used. the code is shown below but the models are loaded from the working directory were they were stored previously as they take hours to run (at least on my laptop!).
+
+```{r, eval=FALSE}
+CART <- train(classe~., data=trainDF, method="rpart")
+RF <- train(classe~., data=trainDF, method="rf", importance=TRUE)
+boost <- train(classe~., data=trainDF, method="gbm", verbose=FALSE)
+lda <- train(classe~., data=trainDF, method="lda")
+svm <- svm(classe~., data =trainDF) 
+```
+```{r, echo=FALSE}
+load("RF.rda")
+load("CART.rda")
+load("lda.rda")
+load("boost.rda")
+load("svm.rda")
+```
+
+## Model accuracy within the training subset
+
+Next we extract the accuracy of each model within the data set they were built from.  
+```{r, include=FALSE}
+CARTpred <- predict(CART, newdata=trainDF)
+RFpred <- predict(RF, newdata=trainDF)
+ldapred <- predict(lda, newdata=trainDF)
+svmpred <- predict(svm, newdata=trainDF)
+boostpred <- predict(boost, newdata=trainDF)
+
+withinTrain <- data.frame(CARTpred, RFpred, ldapred, svmpred, boostpred,
+                          classe=trainDF$classe)
+
+CART.Accu <- confusionMatrix(CARTpred, withinTrain$classe)$overall['Accuracy']
+RF.Accu <- confusionMatrix(RFpred, withinTrain$classe)$overall['Accuracy']
+lda.Accu <- confusionMatrix(ldapred, withinTrain$classe)$overall['Accuracy']
+svm.Accu <- confusionMatrix(svmpred, withinTrain$classe)$overall['Accuracy']
+boost.Accu <- confusionMatrix(boostpred, withinTrain$classe)$overall['Accuracy']
+
+accuracy <- c(CART.Accu, RF.Accu, lda.Accu, svm.Accu, boost.Accu)
+model <- c("CART", "RF", "lda", "svm", "boost")
+TRAINacc <- data.frame(model, accuracy)
+print(TRAINacc)
+```
+```{r}
+CARTpred <- predict(CART, newdata=trainDF)
+RFpred <- predict(RF, newdata=trainDF)
+ldapred <- predict(lda, newdata=trainDF)
+svmpred <- predict(svm, newdata=trainDF)
+boostpred <- predict(boost, newdata=trainDF)
+
+withinTrain <- data.frame(CARTpred, RFpred, ldapred, svmpred, boostpred,
+                          classe=trainDF$classe)
+
+CART.Accu <- confusionMatrix(CARTpred, withinTrain$classe)$overall['Accuracy']
+RF.Accu <- confusionMatrix(RFpred, withinTrain$classe)$overall['Accuracy']
+lda.Accu <- confusionMatrix(ldapred, withinTrain$classe)$overall['Accuracy']
+svm.Accu <- confusionMatrix(svmpred, withinTrain$classe)$overall['Accuracy']
+boost.Accu <- confusionMatrix(boostpred, withinTrain$classe)$overall['Accuracy']
+
+accuracy <- c(CART.Accu, RF.Accu, lda.Accu, svm.Accu, boost.Accu)
+model <- c("CART", "RF", "lda", "svm", "boost")
+TRAINacc <- data.frame(model, accuracy)
+print(TRAINacc)
+
+```
+The random forrest model has perfect performance with the boosted tree and SVM models also performing well. This is promising as out of sample accuracy for these models should (in theory) be good.  
+
+## Out of sample accuracy of the five models
+
+Here we run the predictions in the in the subset of full training set reserved for testing.
+
+```{r}
+
+CARTpred <- predict(CART, newdata=testDF)
+RFpred <- predict(RF, newdata=testDF)
+ldapred <- predict(lda, newdata=testDF)
+svmpred <- predict(svm, newdata=testDF)
+boostpred <- predict(boost, newdata=testDF)
+
+withinTEST <- data.frame(CARTpred, RFpred, ldapred, svmpred, boostpred,
+                          classe=testDF$classe)
+
+CART.Accu <- confusionMatrix(CARTpred, withinTEST$classe)$overall['Accuracy']
+RF.Accu <- confusionMatrix(RFpred, withinTEST$classe)$overall['Accuracy']
+lda.Accu <- confusionMatrix(ldapred, withinTEST$classe)$overall['Accuracy']
+svm.Accu <- confusionMatrix(svmpred, withinTEST$classe)$overall['Accuracy']
+boost.Accu <- confusionMatrix(boostpred, withinTEST$classe)$overall['Accuracy']
+
+accuracy <- c(CART.Accu, RF.Accu, lda.Accu, svm.Accu, boost.Accu)
+model <- c("CART", "RF", "lda", "svm", "boost")
+TESTacc <- data.frame(model, accuracy)
+print(TESTacc)
+```
+
+The random forrest model is again the best performing and is selected for the validation sample.  
+
+## Predictions in the validation set
+
+First the validations set is pre processed using the same variable selection, and centering and scaling values as were used in the full training set. 
+```{r}
+problem_id <- testing$problem_id
+
+# limit to variables used in models (at time before preprocessing)
+preProcVars <- preProcVars[-58]
+testing <- testing[ ,preProcVars]
+
+# preprocess (center and scale) using the preProcess object created with the training set
+testing <- predict(preObj, testing)
+
+```
+
+Now the validation set observations are run through the random forrest model to generate the predictions.
+
+```{r}
+predictions <- predict(RF, newdata=testing)
+
+# store final predictions
+validation_predictions <- data.frame(problem_id, predictions)
+print(validation_predictions)
+```
+
